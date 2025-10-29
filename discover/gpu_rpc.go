@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ollama/ollama/ml"
 )
 
 // RPCServerMemory checks and total and free memory in bytes of a given RPC
@@ -140,10 +142,10 @@ func getRPCServerMemory(endpoint string) RPCServerMemoryResult {
 }
 
 // Find valid RPC servers from a comma seperated list of endpoints.
-func GetRPCServers(endpoints string) GpuInfoList {
+func GetRPCServers(endpoints string) []ml.DeviceInfo {
 	slog.Debug("finding valid rpc servers", "endpoints", endpoints)
 	rpcServersList := strings.Split(endpoints, ",")
-	var validServers GpuInfoList
+	var validServers []ml.DeviceInfo
 	for _, server := range rpcServersList {
 		// No servers given
 		if server == "" {
@@ -165,13 +167,14 @@ func GetRPCServers(endpoints string) GpuInfoList {
 			continue
 		}
 
-		serverInfo := GpuInfo{
-			ID:      server,
-			Library: "rpc",
+		serverInfo := ml.DeviceInfo{
+			DeviceID: ml.DeviceID{
+				ID:      server,
+				Library: "rpc",
+			},
+			TotalMemory: info.TotalMem,
+			FreeMemory:  info.FreeMem,
 		}
-
-		serverInfo.TotalMemory = info.TotalMem
-		serverInfo.FreeMemory = info.FreeMem
 
 		if serverInfo.TotalMemory == 0 && serverInfo.FreeMemory == 0 {
 			slog.Warn("unable to connect to endpoint", "endpoint", server)
