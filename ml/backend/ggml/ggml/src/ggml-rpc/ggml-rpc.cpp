@@ -109,6 +109,47 @@ enum rpc_cmd {
     RPC_CMD_COUNT,
 };
 
+static string rpc_cmd_to_string(enum rpc_cmd cmd){
+    switch (cmd) {
+    case RPC_CMD_ALLOC_BUFFER:
+        return "RPC_CMD_ALLOC_BUFFER";
+    case RPC_CMD_GET_ALIGNMENT:
+        return "RPC_CMD_GET_ALIGNMENT";
+    case RPC_CMD_GET_MAX_SIZE:
+        return "RPC_CMD_GET_MAX_SIZE";
+    case RPC_CMD_BUFFER_GET_BASE:
+        return "RPC_CMD_BUFFER_GET_BASE";
+    case RPC_CMD_FREE_BUFFER:
+        return "RPC_CMD_FREE_BUFFER";
+    case RPC_CMD_BUFFER_CLEAR:
+        return "RPC_CMD_BUFFER_CLEAR"
+    case RPC_CMD_SET_TENSOR:
+        return "RPC_CMD_SET_TENSOR";
+    case RPC_CMD_SET_TENSOR_HASH:
+        return "RPC_CMD_SET_TENSOR_HASH";
+    case RPC_CMD_GET_TENSOR:
+       return "RPC_CMD_GET_TENSOR";
+    case RPC_CMD_COPY_TENSOR:
+       return "RPC_CMD_COPY_TENSOR";
+    case RPC_CMD_GRAPH_COMPUTE:
+       return "RPC_CMD_GRAPH_COMPUTE";
+    case RPC_CMD_GET_DEVICE_MEMORY:
+       return "RPC_CMD_GET_DEVICE_MEMORY";
+    case RPC_CMD_INIT_TENSOR:
+        return "RPC_CMD_INIT_TENSOR";
+    case RPC_CMD_GET_ALLOC_SIZE:
+       return "RPC_CMD_GET_ALLOC_SIZE";
+    case RPC_CMD_HELLO:
+        return "RPC_CMD_HELLO";
+    case RPC_CMD_DEVICE_COUNT:
+       return "RPC_CMD_DEVICE_COUNT";
+    case RPC_CMD_COUNT:
+       return "RPC_CMD_COUNT";
+    }
+
+    return "UNKNOWN";
+}
+
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
@@ -1508,6 +1549,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        LOG_DBG("[%s] received command: %d\n", __func__, cmd);
+        LOG_DBG("[%s] received command: %s\n", __func__, rpc_cmd_to_str(cmd));
+
         switch (cmd) {
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
