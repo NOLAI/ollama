@@ -35,31 +35,6 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
-extern bool reserving_graph;
-
-// If we are reserving the graph, pointers might be invalid and will fail if cudaMemcpyAsync tries to validate them.
-// However, since we don't actually expect a result, we don't need to actually do the memcpy.
-static cudaError_t cudaMemcpyAsyncReserve ( void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream = 0 ) {
-    if (!reserving_graph) {
-        return cudaMemcpyAsync(dst, src, count, kind, stream);
-    } else {
-        return cudaSuccess;
-    }
-}
-
-static cudaError_t cudaMemcpy2DAsyncReserve ( void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, cudaMemcpyKind kind, cudaStream_t stream = 0 ) {
-    if (!reserving_graph) {
-        return cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind, stream);
-    } else {
-        return cudaSuccess;
-    }
-}
-
-#undef cudaMemcpyAsync
-#define cudaMemcpyAsync cudaMemcpyAsyncReserve
-#undef cudaMemcpy2DAsync
-#define cudaMemcpy2DAsync cudaMemcpy2DAsyncReserve
-
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -650,8 +625,11 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 // and a shift:
 //
 // n/d = (mulhi(n, mp) + n) >> L;
-static const uint3 init_fastdiv_values(uint32_t d) {
-    GGML_ASSERT(d != 0);
+static const uint3 init_fastdiv_values(uint64_t d_64) {
+    GGML_ASSERT(d_64 != 0);
+    GGML_ASSERT(d_64 <= std::numeric_limits<uint32_t>::max());
+
+    uint32_t d = (uint32_t)d_64;
 
     // compute L = ceil(log2(d));
     uint32_t L = 0;
@@ -881,9 +859,6 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
-
-    virtual bool alloc_memory() = 0;
-    virtual size_t alloc_size() = 0;
 };
 
 template<typename T>
@@ -972,13 +947,6 @@ struct ggml_cuda_graph {
     bool disable_due_to_failed_graph_capture = false;
     int number_consecutive_updates = 0;
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
-    bool use_cpy_indirection = false;
-    std::vector<char *> cpy_dest_ptrs;
-    char ** dest_ptrs_d;
-    int dest_ptrs_size = 0;
-    // Index to allow each cpy kernel to be aware of it's position within the graph
-    // relative to other cpy nodes.
-    int graph_cpynode_index = -1;
 #endif
 };
 
@@ -1027,11 +995,11 @@ struct ggml_backend_cuda_context {
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES];
 
-    static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, bool alloc);
+    static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device);
 
     ggml_cuda_pool & pool(int device) {
         if (pools[device] == nullptr) {
-            pools[device] = new_pool_for_device(device, true);
+            pools[device] = new_pool_for_device(device);
         }
         return *pools[device];
     }
@@ -1039,20 +1007,17 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+};
 
-    void pool_set_alloc(bool alloc) {
-        GGML_ASSERT(pools[device] == nullptr || pools[device]->alloc_memory() == alloc);
-
-        if (pools[device] == nullptr) {
-            pools[device] = new_pool_for_device(device, alloc);
-        }
-    }
-
-    size_t pool_get_alloc_size() {
-        if (pools[device] == nullptr) {
-            return 0;
-        }
-
-        return pools[device]->alloc_size();
-    }
+struct ggml_cuda_mm_fusion_args_host {
+    const ggml_tensor * x_bias = nullptr;
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * gate_bias = nullptr;
+    ggml_glu_op glu_op;
+};
+struct ggml_cuda_mm_fusion_args_device {
+    const void * x_bias = nullptr;
+    const void * gate = nullptr;
+    const void * gate_bias = nullptr;
+    ggml_glu_op glu_op;
 };

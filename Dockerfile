@@ -126,6 +126,7 @@ RUN --mount=type=cache,target=/root/.ccache \
     cmake --preset 'ROCm 6' \
         -DOLLAMA_RUNNER_DIR="rocm_v7" \
         -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+        -DGGML_USE_VMM="ON" \
         && cmake --build --parallel ${PARALLEL} --preset 'ROCm 6' \
         && cmake --install build --component HIP --strip --parallel ${PARALLEL}
 RUN rm -f dist/lib/ollama/rocm_v7/rocblas/library/*gfx90[06]*
