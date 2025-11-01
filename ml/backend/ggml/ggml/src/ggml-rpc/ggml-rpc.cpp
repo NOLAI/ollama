@@ -407,7 +407,6 @@ static bool send_data(sockfd_t sockfd, const void * data, size_t size) {
     }
     return true;
 }
-
 static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
@@ -428,21 +427,6 @@ static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
 }
 
 static bool send_msg(sockfd_t sockfd, const void * msg, size_t msg_size) {
-    printf("Sending message: %zu bytes\n", msg_size);
-
-    if (msg != nullptr && msg_size > 0) {
-        printf("  Data: ");
-        const unsigned char * data = (const unsigned char *)msg;
-        size_t n_print = (msg_size > 32) ? 32 : msg_size; // Print up to 32 bytes
-        for (size_t i = 0; i < n_print; ++i) {
-            printf("%02x ", data[i]);
-        }
-        if (msg_size > 32) {
-            printf("...");
-        } else {
-            printf("\n");
-        }
-    }
 
     if (!send_data(sockfd, &msg_size, sizeof(msg_size))) {
         return false;
@@ -1565,8 +1549,6 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
-
-        printf("received command: %s which was in numbers: %d \n", rpc_cmd_to_string(cmd).c_str(), cmd);
 
         switch (cmd) {
             case RPC_CMD_HELLO: {
