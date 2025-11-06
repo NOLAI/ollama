@@ -76,9 +76,30 @@ func EnumerateGPUs() []ml.DeviceID {
 			C.GGML_BACKEND_DEVICE_TYPE_IGPU:
 			var props C.struct_ggml_backend_dev_props
 			C.ggml_backend_dev_get_props(device, &props)
+
+			// The new ggml API doesn't have props.id and props.library
+			// Determine ID and library from device name
+			deviceName := C.GoString(props.name)
+			deviceDesc := C.GoString(props.description)
+
+			var id, library string
+			if len(deviceName) >= 3 && deviceName[:3] == "RPC" {
+				id = deviceDesc
+				library = "rpc"
+			} else if len(deviceName) >= 4 && deviceName[:4] == "ROCm" {
+				id = deviceName
+				library = "rocm"
+			} else if len(deviceName) >= 4 && deviceName[:4] == "CUDA" {
+				id = deviceName
+				library = "cuda"
+			} else {
+				id = deviceName
+				library = "gpu"
+			}
+
 			ids = append(ids, ml.DeviceID{
-				ID:      C.GoString(props.id),
-				Library: C.GoString(props.library),
+				ID:      id,
+				Library: library,
 			})
 		}
 	}

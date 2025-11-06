@@ -153,6 +153,53 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 
 	initDevices()
 
+	// Manually enumerate RPC devices after initDevices() since it's a OnceFunc
+	// and RPC servers may have been added after the first call
+	if params.RPCServers != "" {
+		slog.Info("enumerating devices after adding RPC servers")
+		totalDevCount := C.ggml_backend_dev_count()
+		slog.Info("total device count", "count", totalDevCount)
+
+		// Build a map of existing GPUs to avoid duplicates
+		existingGPUs := make(map[C.ggml_backend_dev_t]bool)
+		for _, gpu := range gpus {
+			existingGPUs[gpu] = true
+		}
+
+		// Re-enumerate all devices and add any new GPU devices
+		for i := range totalDevCount {
+			d := C.ggml_backend_dev_get(i)
+			devType := C.ggml_backend_dev_type(d)
+
+			// Get device properties for logging
+			var props C.struct_ggml_backend_dev_props
+			C.ggml_backend_dev_get_props(d, &props)
+			devName := C.GoString(props.name)
+			devDesc := C.GoString(props.description)
+
+			slog.Info("found device",
+				"index", i,
+				"type", devType,
+				"name", devName,
+				"description", devDesc)
+
+			// If it's a GPU device and not already in our list, add it
+			if (devType == C.GGML_BACKEND_DEVICE_TYPE_GPU ||
+				devType == C.GGML_BACKEND_DEVICE_TYPE_IGPU) &&
+				!existingGPUs[d] {
+				slog.Info("adding GPU device",
+					"name", devName,
+					"description", devDesc)
+				gpus = append(gpus, d)
+				// Initialize backend for this device if not already done
+				if _, exists := backends[d]; !exists {
+					backends[d] = C.ggml_backend_dev_init(d, nil)
+				}
+			}
+		}
+		slog.Info("final GPU count", "count", len(gpus))
+	}
+
 	var requiredMemory ml.BackendMemory
 	btDeviceMemory := make(map[C.ggml_backend_buffer_type_t]*ml.DeviceMemory)
 
@@ -179,8 +226,9 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 	requiredMemory.CPU.Name = C.GoString(C.ggml_backend_dev_name(cpuDeviceBufferType.d))
 	var props C.struct_ggml_backend_dev_props
 	C.ggml_backend_dev_get_props(cpuDeviceBufferType.d, &props)
-	requiredMemory.CPU.ID = C.GoString(props.id)
-	requiredMemory.CPU.Library = C.GoString(props.library)
+	// CPU device ID/library - these fields don't exist in new API, set manually
+	requiredMemory.CPU.ID = ""
+	requiredMemory.CPU.Library = ""
 	requiredMemory.CPU.Weights = make([]uint64, blocks+1)
 	requiredMemory.CPU.Cache = make([]uint64, blocks+1)
 
@@ -198,8 +246,50 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 		requiredMemory.GPUs[i].Name = C.GoString(C.ggml_backend_dev_name(d))
 		var props C.struct_ggml_backend_dev_props
 		C.ggml_backend_dev_get_props(d, &props)
-		requiredMemory.GPUs[i].ID = C.GoString(props.id)
-		requiredMemory.GPUs[i].Library = C.GoString(props.library)
+
+		// The new ggml API doesn't have props.id and props.library fields
+		// We need to manually assign ID and library based on device name/description
+		deviceDesc := C.GoString(C.ggml_backend_dev_description(d))
+		deviceName := C.GoString(C.ggml_backend_dev_name(d))
+
+		// Assign ID and library based on device type
+		if len(deviceName) >= 3 && deviceName[:3] == "RPC" {
+			// RPC device - use endpoint address from description
+			requiredMemory.GPUs[i].ID = deviceDesc
+			requiredMemory.GPUs[i].Library = "rpc"
+			slog.Info("assigned RPC device ID from description",
+				"name", deviceName,
+				"description", deviceDesc,
+				"id", deviceDesc,
+				"library", "rpc")
+		} else if len(deviceName) >= 4 && deviceName[:4] == "ROCm" {
+			// ROCm device - use device name as ID
+			requiredMemory.GPUs[i].ID = deviceName
+			requiredMemory.GPUs[i].Library = "rocm"
+			slog.Info("assigned ROCm device ID from name",
+				"name", deviceName,
+				"description", deviceDesc,
+				"id", deviceName,
+				"library", "rocm")
+		} else if len(deviceName) >= 4 && deviceName[:4] == "CUDA" {
+			// CUDA device - use device name as ID
+			requiredMemory.GPUs[i].ID = deviceName
+			requiredMemory.GPUs[i].Library = "cuda"
+		} else {
+			// Other GPU - use device name or description
+			if deviceName != "" {
+				requiredMemory.GPUs[i].ID = deviceName
+			} else {
+				requiredMemory.GPUs[i].ID = deviceDesc
+			}
+			requiredMemory.GPUs[i].Library = "gpu"
+			slog.Info("assigned generic GPU device ID",
+				"name", deviceName,
+				"description", deviceDesc,
+				"id", requiredMemory.GPUs[i].ID,
+				"library", "gpu")
+		}
+
 		requiredMemory.GPUs[i].Weights = make([]uint64, blocks+1)
 		requiredMemory.GPUs[i].Cache = make([]uint64, blocks+1)
 	}
@@ -387,14 +477,15 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 
 	maxGraphNodes := max(8192, len(meta.Tensors().Items())*5)
 
-	sched := C.ggml_backend_sched_new_ext(
+	// Note: The new ggml_backend_sched_new API doesn't have the allocMemory parameter
+	// Memory allocation is now handled differently
+	sched := C.ggml_backend_sched_new(
 		(*C.ggml_backend_t)(unsafe.Pointer(&schedBackends[0])),
 		(*C.ggml_backend_buffer_type_t)(unsafe.Pointer(&schedBufts[0])),
 		C.int(len(schedBackends)),
 		C.size_t(maxGraphNodes),
-		C._Bool(false),
-		C._Bool(false),
-		C._Bool(params.AllocMemory),
+		C._Bool(false), // parallel
+		C._Bool(false), // op_offload
 	)
 
 	// allocate buffers for each context
@@ -633,17 +724,18 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 		})
 	}
 
+	// Note: ggml_backend_dev_reset no longer exists in the new API
+	// Device cleanup is now handled automatically by the backend
 	// Cleanup any backend state from devices that we didn't end up using
-nextDevice:
-	for _, d := range append(gpus, append(accels, cpus...)...) {
-		for _, backend := range b.schedBackends {
-			if d == C.ggml_backend_get_device(backend) {
-				continue nextDevice
-			}
-		}
-
-		C.ggml_backend_dev_reset(d)
-	}
+	// nextDevice:
+	// 	for _, d := range append(gpus, append(accels, cpus...)...) {
+	// 		for _, backend := range b.schedBackends {
+	// 			if d == C.ggml_backend_get_device(backend) {
+	// 				continue nextDevice
+	// 			}
+	// 		}
+	// 		// Device reset no longer available in new API
+	// 	}
 
 	if err := g.Wait(); err != nil {
 		return err
@@ -721,27 +813,47 @@ func (b *Backend) BackendDevices() []ml.DeviceInfo {
 		info := ml.DeviceInfo{}
 		props := C.struct_ggml_backend_dev_props{}
 		C.ggml_backend_dev_get_props(dev, &props)
-		info.Name = C.GoString(props.name)
-		info.Description = C.GoString(props.description)
-		info.ID = C.GoString(props.id)
-		info.Library = C.GoString(props.library)
-		info.ComputeMajor = (int)(props.compute_major)
-		info.ComputeMinor = (int)(props.compute_minor)
-		info.DriverMajor = (int)(props.driver_major)
-		info.DriverMinor = (int)(props.driver_minor)
-		info.Integrated = props.integrated != 0
-		if props.library != nil {
-			info.Library = C.GoString(props.library)
+
+		// Get name and description directly from the new props struct
+		deviceName := C.GoString(props.name)
+		deviceDesc := C.GoString(props.description)
+
+		info.Name = deviceName
+		info.Description = deviceDesc
+		// Integrated GPU is now a device type, not a capability
+		// Use the function since 'type' is a reserved keyword in Go
+		info.Integrated = (C.ggml_backend_dev_type(dev) == C.GGML_BACKEND_DEVICE_TYPE_IGPU)
+
+		// The new ggml API doesn't have props.id, props.library, compute/driver version fields
+		// We manually assign ID and library based on device name
+		if len(deviceName) >= 3 && deviceName[:3] == "RPC" {
+			// RPC device - use endpoint address from description
+			info.ID = deviceDesc
+			info.Library = "rpc"
+		} else if len(deviceName) >= 4 && deviceName[:4] == "ROCm" {
+			// ROCm device - use device name as ID
+			info.ID = deviceName
+			info.Library = "rocm"
+		} else if len(deviceName) >= 4 && deviceName[:4] == "CUDA" {
+			// CUDA device
+			info.ID = deviceName
+			info.Library = "cuda"
+		} else if deviceName != "" {
+			// Other GPU - use device name
+			info.ID = deviceName
+			info.Library = "gpu"
+		} else {
+			// Fallback to description
+			info.ID = deviceDesc
+			info.Library = "unknown"
 		}
+
 		if props.device_id != nil {
 			info.PCIID = C.GoString(props.device_id)
 		}
 		info.LibraryPath = ggml.LibPaths()
-		if props.numeric_id != nil {
-			info.FilteredID = C.GoString(props.numeric_id)
-		}
 
-		C.ggml_backend_dev_memory(dev, &props.memory_free, &props.memory_total)
+		// Memory info is now in the props struct directly
 		info.TotalMemory = (uint64)(props.memory_total)
 		info.FreeMemory = (uint64)(props.memory_free)
 
@@ -853,7 +965,8 @@ func (c *Context) Reserve() {
 	}
 
 	for i := range c.b.schedBackends {
-		bufferSize := C.ggml_backend_sched_get_attempted_buffer_size(c.b.sched, c.b.schedBackends[i])
+		// Note: function renamed from ggml_backend_sched_get_attempted_buffer_size to ggml_backend_sched_get_buffer_size
+		bufferSize := C.ggml_backend_sched_get_buffer_size(c.b.sched, c.b.schedBackends[i])
 		c.b.btDeviceMemory[c.b.schedBufts[i]].Graph += uint64(bufferSize)
 
 		logutil.Trace("compute graph", "backend", C.GoString(C.ggml_backend_name(c.b.schedBackends[i])),

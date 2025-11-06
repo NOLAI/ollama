@@ -871,7 +871,20 @@ func (s *ollamaServer) buildLayout(systemGPUs []ml.DeviceInfo, memory *ml.Backen
 	}
 
 	gpuLayers := ml.GPULayersList{}
-	for _, gl := range ml.ByLibrary(gpus) {
+
+	// When RPC servers are configured, combine all libraries instead of picking the best one
+	libraries := ml.ByLibrary(gpus)
+	if envconfig.RPCServers() != "" && envconfig.SchedSpread() && len(libraries) > 1 {
+		slog.Info("combining libraries for RPC with spread scheduling", "num_libraries", len(libraries))
+		// Combine all GPUs from all libraries into a single group
+		combinedGPUs := []ml.DeviceInfo{}
+		for _, lib := range libraries {
+			combinedGPUs = append(combinedGPUs, lib...)
+		}
+		libraries = [][]ml.DeviceInfo{combinedGPUs}
+	}
+
+	for _, gl := range libraries {
 		// If a GPU already has a graph allocated on it, then we should continue to use it.
 		// Otherwise, we lose information that we got from previous allocations, which can
 		// cause cycling. Plus, we get more information about required allocation from each
