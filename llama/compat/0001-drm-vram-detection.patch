@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e73a7b8..85c9568 100644
+index 2456f7d..9c36638 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4548,78 +4548,73 @@ static const char * ggml_backend_cuda_device_get_description(ggml_backend_dev_t
+@@ -4695,78 +4695,73 @@ static const char * ggml_backend_cuda_device_get_description(ggml_backend_dev_t
  }
  
  #if defined(__linux__)
@@ -137,14 +137,12 @@ index e73a7b8..85c9568 100644
  }
  #endif // defined(__linux__)
  
-@@ -4635,25 +4630,17 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
+@@ -4782,28 +4777,20 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
          return;
      }
  
 -// ref: https://github.com/ggml-org/llama.cpp/pull/17368
-+// Use DRM sysfs for accurate VRAM (+GTT for iGPUs) on Linux AMD GPUs.
-+// /proc/meminfo MemAvailable reflects free host RAM, not GPU VRAM.
- #if defined(__linux__)
+-#if defined(__linux__) && !defined(GGML_USE_HIP)
 -    // Check if this is a UMA (Unified Memory Architecture) system
 -    cudaDeviceProp prop;
 -    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
@@ -162,6 +160,9 @@ index e73a7b8..85c9568 100644
 -            *free = (size_t)available_memory_kb * 1024;
 -        } else {
 -            GGML_LOG_ERROR("%s: /proc/meminfo reading failed, using cudaMemGetInfo\n", __func__);
++// Use DRM sysfs for accurate VRAM (+GTT for iGPUs) on Linux AMD GPUs.
++// /proc/meminfo MemAvailable reflects free host RAM, not GPU VRAM.
++#if defined(__linux__)
 +    if (!ctx->pci_bus_id.empty()) {
 +        cudaDeviceProp prop;
 +        CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
@@ -172,4 +173,8 @@ index e73a7b8..85c9568 100644
 +            *total = drm_total;
          }
      }
- #endif // defined(__linux__)
+-#endif // defined(__linux__) && !defined(GGML_USE_HIP)
++#endif // defined(__linux__)
+ 
+     // virtual devices sharing one physical GPU share its memory pool; split it between them
+     const int share_count = ggml_cuda_physical_device_share_count(ctx->device);
