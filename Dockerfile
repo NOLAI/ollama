@@ -220,8 +220,8 @@ ENV CGO_LDFLAGS="-L/usr/local/cuda-13/lib64 -L/usr/local/cuda-13/targets/x86_64-
 WORKDIR /go/src/github.com/ollama/ollama
 COPY CMakeLists.txt CMakePresets.json .
 COPY cmake cmake
-COPY x/mlxrunner/mlx x/mlxrunner/mlx
-COPY x/mlxrunner/xgrammar/native x/mlxrunner/xgrammar/native
+COPY mlx mlx
+COPY mlxrunner/xgrammar/native mlxrunner/xgrammar/native
 COPY go.mod go.sum .
 COPY MLX_VERSION MLX_C_VERSION .
 RUN curl -fsSL https://golang.org/dl/go$(awk '/^go/ { print $2 }' go.mod).linux-$(case $(uname -m) in x86_64) echo amd64 ;; aarch64) echo arm64 ;; esac).tar.gz | tar xz -C /usr/local
@@ -316,7 +316,7 @@ RUN sed -i \
         -e "s|http://ports.ubuntu.com/ubuntu-ports|$APT_PORTS_MIRROR|g" \
         /etc/apt/sources.list.d/ubuntu.sources \
     && apt-get update \
-    && apt-get install -y ca-certificates libvulkan1 libopenblas0 \
+    && apt-get install -y ca-certificates libvulkan1 libopenblas0 ffmpeg \
     && sed -i \
         -e "s|$APT_MIRROR|http://archive.ubuntu.com/ubuntu|g" \
         -e "s|$APT_PORTS_MIRROR|http://ports.ubuntu.com/ubuntu-ports|g" \
@@ -340,7 +340,13 @@ COPY --from=llama-server-cpu dist/lib/ollama /usr/lib/ollama
 COPY --from=llama-server-rocm_v7_2 dist/lib/ollama /usr/lib/ollama
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib/ollama
 ENV OLLAMA_HOST=0.0.0.0:11434
-RUN dnf clean all && \
+# ffmpeg (providing ffprobe) is required at runtime by llama.cpp's mtmd video
+# pipeline for frame extraction. AlmaLinux/RHEL keep it out of the base repos
+# for licensing reasons, so it comes from RPM Fusion via EPEL.
+RUN dnf install -y epel-release \
+    && dnf install -y --nogpgcheck "https://download1.rpmfusion.org/free/el/rpmfusion-free-release-8.noarch.rpm" \
+    && dnf install -y ffmpeg \
+    && dnf clean all && \
     rm -rf /var/cache/dnf/* /var/lib/dnf/*.sqlite* /var/lib/dnf/history.* /tmp/* /var/lib/rpm/__db.*
 EXPOSE 11434
 ENTRYPOINT ["/usr/bin/ollama"]

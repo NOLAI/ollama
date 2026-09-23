@@ -37,8 +37,9 @@ func defaultLlamaCppBinarySearch() llamaCppBinarySearch {
 	}
 }
 
-// FindLlamaCppBinary locates a llama.cpp helper binary in installed and local
-// development layouts.
+// FindLlamaCppBinary locates a named llama.cpp binary (e.g. "llama-rpc-server")
+// in lib/ollama/, for callers outside this package that need a binary other
+// than llama-server.
 func FindLlamaCppBinary(name string) (string, error) {
 	path, candidates, err := findLlamaCppBinary(name, defaultLlamaCppBinarySearch())
 	if err != nil {

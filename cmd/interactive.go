@@ -18,6 +18,7 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/internal/modelref"
+	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/readline"
 	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
@@ -353,6 +354,10 @@ func generateInteractive(cmd *cobra.Command, opts runOptions) error {
 						continue
 					}
 					params := args[3:]
+					if args[2] == "typical_p" {
+						fmt.Printf("Couldn't set parameter: %q\n", errTypicalPUnsupported)
+						continue
+					}
 					fp, err := api.FormatParams(map[string][]string{args[2]: params})
 					if err != nil {
 						fmt.Printf("Couldn't set parameter: %q\n", err)
@@ -606,7 +611,7 @@ func extractFileNames(input string) []string {
 	// Regex to match file paths starting with optional drive letter, / ./ \ or .\ and include escaped or unescaped spaces (\ or %20)
 	// and followed by more characters and a file extension
 	// This will capture non filename strings, but we'll check for file existence to remove mismatches
-	regexPattern := `(?:[a-zA-Z]:)?(?:\./|/|\\)[\S\\ ]+?\.(?i:jpg|jpeg|png|webp|wav)\b`
+	regexPattern := `(?:[a-zA-Z]:)?(?:\./|/|\\)[\S\\ ]+?\.(?i:jpg|jpeg|png|webp|wav|mp4|mov|webm|mkv|avi)\b`
 	re := regexp.MustCompile(regexPattern)
 
 	return re.FindAllString(input, -1)
@@ -629,6 +634,8 @@ func extractFileData(input string) (string, []api.ImageData, error) {
 		switch ext {
 		case ".wav":
 			fmt.Fprintf(os.Stderr, "Added audio '%s'\n", nfp)
+		case ".mp4", ".mov", ".webm", ".mkv", ".avi":
+			fmt.Fprintf(os.Stderr, "Added video '%s'\n", nfp)
 		default:
 			fmt.Fprintf(os.Stderr, "Added image '%s'\n", nfp)
 		}
@@ -708,7 +715,8 @@ func getImageData(filePath string) ([]byte, error) {
 
 	contentType := http.DetectContentType(buf)
 	allowedTypes := []string{"image/jpeg", "image/jpg", "image/png", "image/webp", "audio/wave"}
-	if !slices.Contains(allowedTypes, contentType) {
+	_, isVideo := llm.VideoFormat(buf)
+	if !slices.Contains(allowedTypes, contentType) && !isVideo {
 		return nil, fmt.Errorf("invalid file type: %s", contentType)
 	}
 

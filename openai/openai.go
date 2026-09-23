@@ -533,33 +533,45 @@ func ToModel(r api.ShowResponse, m string) Model {
 	}
 }
 
-// thinkFromReasoningEffort converts an OpenAI reasoning effort to the equivalent
-// Ollama think value. An empty effort leaves thinking at the model's default.
-//
-// OpenAI's scale extends past both ends of Ollama's ("minimal" below "low",
-// "xhigh" above "high"), and clients built on it add tiers of their own
-// ("ultra"). Clamp those to the nearest Ollama tier rather than rejecting the
-// request, since the alternative is a 400 for an effort the client considers
-// perfectly valid.
-func thinkFromReasoningEffort(effort string) (*api.ThinkValue, error) {
+// ThinkingFromReasoningEffort preserves model-defined names when metadata is present.
+// Boolean-only models retain the OpenAI on/off controls; models without metadata
+// retain the legacy effort aliases.
+func ThinkingFromReasoningEffort(effort string, thinking ...*model.Thinking) (*api.ThinkValue, error) {
 	switch effort {
 	case "":
 		return nil, nil
 	case "none":
 		return &api.ThinkValue{Value: false}, nil
-	case "minimal":
-		return &api.ThinkValue{Value: "low"}, nil
-	case "low", "medium", "high", "max":
-		return &api.ThinkValue{Value: effort}, nil
-	case "xhigh", "ultra":
-		return &api.ThinkValue{Value: "max"}, nil
-	default:
-		return nil, fmt.Errorf("invalid reasoning value: %q (must be \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\", or \"none\")", effort)
 	}
+	requestedEffort := effort
+	switch effort {
+	case "minimal":
+		effort = "low"
+	case "xhigh", "ultra":
+		effort = "max"
+	}
+	think := &api.ThinkValue{Value: effort}
+	err := api.ValidateLegacyThinking(think)
+	if len(thinking) > 0 && thinking[0].Valid() {
+		if err == nil && thinking[0].Supports(true) {
+			for _, value := range thinking[0].Values {
+				if _, named := value.(string); named {
+					return &api.ThinkValue{Value: requestedEffort}, nil
+				}
+			}
+			return &api.ThinkValue{Value: true}, nil
+		}
+		return &api.ThinkValue{Value: requestedEffort}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("invalid reasoning value: %q (must be \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"max\", or \"none\")", requestedEffort)
+	}
+	return think, nil
 }
 
-// FromChatRequest converts a ChatCompletionRequest to api.ChatRequest
-func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
+// FromChatRequest converts a ChatCompletionRequest to api.ChatRequest.
+// An optional thinking descriptor preserves model-defined effort names for rendering.
+func FromChatRequest(r ChatCompletionRequest, thinking ...*model.Thinking) (*api.ChatRequest, error) {
 	var messages []api.Message
 	for _, msg := range r.Messages {
 		toolName := ""
@@ -621,6 +633,25 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 						return nil, fmt.Errorf("invalid input_audio base64 data: %w", err)
 					}
 					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{audioBytes}})
+				case "input_video":
+					videoMap, ok := data["input_video"].(map[string]any)
+					if !ok {
+						return nil, errors.New("invalid input_video format")
+					}
+					url, ok := videoMap["data"].(string)
+					if !ok {
+						url, ok = videoMap["url"].(string)
+					}
+					if !ok {
+						return nil, errors.New("invalid input_video format: missing data")
+					}
+
+					video, err := decodeVideoURL(url)
+					if err != nil {
+						return nil, err
+					}
+
+					messages = append(messages, api.Message{Role: msg.Role, Images: []api.ImageData{video}})
 				default:
 					return nil, errors.New("invalid message format")
 				}
@@ -715,7 +746,7 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		effort = *r.ReasoningEffort
 	}
 
-	think, err := thinkFromReasoningEffort(effort)
+	think, err := ThinkingFromReasoningEffort(effort, thinking...)
 	if err != nil {
 		return nil, err
 	}
@@ -779,6 +810,38 @@ func decodeImageURL(url string) (api.ImageData, error) {
 		return nil, errors.New("invalid image input")
 	}
 	return img, nil
+}
+
+// decodeVideoURL decodes a base64 data URI into raw video bytes.
+func decodeVideoURL(url string) (api.ImageData, error) {
+	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		return nil, errors.New("video URLs are not currently supported, please use base64 encoded data instead")
+	}
+
+	types := []string{"mp4", "webm", "avi", "quicktime", "x-matroska"}
+
+	if strings.HasPrefix(url, "data:;base64,") {
+		url = strings.TrimPrefix(url, "data:;base64,")
+	} else {
+		valid := false
+		for _, t := range types {
+			prefix := "data:video/" + t + ";base64,"
+			if strings.HasPrefix(url, prefix) {
+				url = strings.TrimPrefix(url, prefix)
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return nil, errors.New("invalid video input")
+		}
+	}
+
+	video, err := base64.StdEncoding.DecodeString(url)
+	if err != nil {
+		return nil, errors.New("invalid video input")
+	}
+	return video, nil
 }
 
 // FromCompletionToolCall converts OpenAI ToolCall format to api.ToolCall
