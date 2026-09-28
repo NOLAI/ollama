@@ -271,6 +271,12 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
 					runnerToExpire = s.findRunnerToUnload()
+				} else if pending.opts.NumGPU != 0 && s.allRPCServersHeld() && len(s.getGpuFn(ctx, runnersSnapshot)) == 0 {
+					// Every device is an RPC server held by a loaded runner, and an
+					// RPC server serves one client at a time. Evict a runner rather
+					// than falling through to a CPU-only load.
+					slog.Info("all RPC servers are held by loaded models, unloading one to make room", "model", pending.model.ModelPath)
+					runnerToExpire = s.findRunnerToUnload()
 				} else {
 					// Either no models are loaded or below envconfig.MaxRunners
 					// Get a refreshed GPU list
@@ -280,7 +286,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					} else {
 						logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
 						gpus = s.getGpuFn(ctx, runnersSnapshot)
-						if rpcServers := envconfig.RPCServers(); rpcServers != "" {
+						if rpcServers := s.freeRPCServers(); rpcServers != "" {
 							gpus = append(gpus, discover.GetRPCServers(rpcServers)...)
 						}
 					}
@@ -511,12 +517,10 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		numParallel = 1
 	}
 
-	// Some architectures are not safe with num_parallel > 1.
-	// ref: https://github.com/ollama/ollama/issues/4165
-	if slices.Contains([]string{"mllama", "qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe", "qwen3next", "lfm2", "lfm2moe", "nemotron_h", "nemotron_h_moe", "nemotron_h_omni"}, req.model.Config.ModelFamily) && numParallel != 1 {
-		numParallel = 1
-		slog.Warn("model architecture does not currently support parallel requests", "architecture", req.model.Config.ModelFamily)
-	}
+	// GGUF models are served by llama-server, which supports parallel slots for
+	// hybrid/recurrent architectures (qwen35, qwen3next, lfm2, nemotron_h, ...),
+	// so an explicit OLLAMA_NUM_PARALLEL is honored for every architecture. The
+	// MLX runner does not use numParallel.
 
 	sessionDuration := envconfig.KeepAlive()
 	if req.sessionDuration != nil {
@@ -710,6 +714,7 @@ iGPUScan:
 		Options:         &req.opts,
 		sessionDuration: sessionDuration,
 		gpus:            gpuIDs,
+		rpcEndpoints:    llm.RPCEndpoints(loadGpus),
 		discreteGPUs:    discreteGPUs,
 		totalSize:       totalSize,
 		vramSize:        vramSize,
@@ -1411,6 +1416,7 @@ type runnerRef struct {
 	pid          int
 	loading      bool          // True only during initial load, then false forever
 	gpus         []ml.DeviceID // Recorded at time of provisioning
+	rpcEndpoints []string      // RPC servers this runner's llama-server holds a connection to
 	discreteGPUs bool          // True if all devices are discrete GPUs - used to skip VRAM recovery check for iGPUs
 	vramSize     uint64
 	totalSize    uint64
@@ -1743,6 +1749,64 @@ func (s *Scheduler) expireRunnersForRuntimeOOM(model *Model, err error) {
 		}
 		runner.refMu.Unlock()
 	}
+}
+
+// heldRPCServers returns the RPC endpoints that loaded runners hold a
+// connection to. llama-rpc-server serves a single client connection at a time,
+// so a held endpoint can't host another model and won't answer a discovery
+// probe until its runner exits.
+func (s *Scheduler) heldRPCServers() map[string]bool {
+	held := make(map[string]bool)
+	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
+	for _, r := range s.loaded {
+		for _, endpoint := range r.rpcEndpoints {
+			held[endpoint] = true
+		}
+	}
+	return held
+}
+
+// configuredRPCServers returns the endpoints listed in OLLAMA_RPC_SERVERS.
+func configuredRPCServers() []string {
+	var endpoints []string
+	for _, endpoint := range strings.Split(envconfig.RPCServers(), ",") {
+		if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
+			endpoints = append(endpoints, endpoint)
+		}
+	}
+	return endpoints
+}
+
+// freeRPCServers returns the configured RPC endpoints, comma separated, that no
+// loaded runner holds.
+func (s *Scheduler) freeRPCServers() string {
+	held := s.heldRPCServers()
+	var free []string
+	for _, endpoint := range configuredRPCServers() {
+		if held[endpoint] {
+			slog.Debug("skipping RPC server held by a loaded model", "endpoint", endpoint)
+			continue
+		}
+		free = append(free, endpoint)
+	}
+	return strings.Join(free, ",")
+}
+
+// allRPCServersHeld reports whether RPC servers are configured and every one
+// of them is held by a loaded runner.
+func (s *Scheduler) allRPCServersHeld() bool {
+	configured := configuredRPCServers()
+	if len(configured) == 0 {
+		return false
+	}
+	held := s.heldRPCServers()
+	for _, endpoint := range configured {
+		if !held[endpoint] {
+			return false
+		}
+	}
+	return true
 }
 
 // findRunnerToUnload finds a runner to unload to make room for a new model

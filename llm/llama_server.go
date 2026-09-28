@@ -626,10 +626,15 @@ func LlamaServerFlashAttention(gpus []ml.DeviceInfo) ml.FlashAttentionType {
 }
 
 // collectRPCEndpoints builds a comma-separated list of unique RPC server
-// endpoints from the gpu list. Device IDs are formatted as
-// "host:port:device_index"; the trailing device index is stripped so each
-// physical server appears only once.
+// endpoints from the gpu list.
 func collectRPCEndpoints(gpus []ml.DeviceInfo) string {
+	return strings.Join(RPCEndpoints(gpus), ",")
+}
+
+// RPCEndpoints returns the unique RPC server endpoints in the gpu list. Device
+// IDs are formatted as "host:port:device_index"; the trailing device index is
+// stripped so each physical server appears only once.
+func RPCEndpoints(gpus []ml.DeviceInfo) []string {
 	seen := make(map[string]bool)
 	var endpoints []string
 	for _, gpu := range gpus {
@@ -647,7 +652,7 @@ func collectRPCEndpoints(gpus []ml.DeviceInfo) string {
 			endpoints = append(endpoints, endpoint)
 		}
 	}
-	return strings.Join(endpoints, ",")
+	return endpoints
 }
 
 func appendFlashAttentionArgs(params []string, gpus []ml.DeviceInfo) []string {

@@ -2313,3 +2313,118 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
 	expectedFree := uint64(24*format.GigaByte) - uint64(8*format.GigaByte) - uint64(4*format.GigaByte)
 	require.Equal(t, expectedFree, gpus[0].FreeMemory)
 }
+
+func TestSchedLoadHonorsNumParallelForHybridArchitectures(t *testing.T) {
+	t.Setenv("OLLAMA_NUM_PARALLEL", "4")
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+	s := InitScheduler(ctx)
+	s.waitForRecovery = 10 * time.Millisecond
+
+	a := newScenarioRequest(t, ctx, "qwen35moe-model", 10, nil, nil)
+	a.req.model.Config.ModelFamily = "qwen35moe"
+	gotParallel := 0
+	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *gguf.Model, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error) {
+		gotParallel = numParallel
+		return a.newServer(systemInfo, gpus, model, f, adapters, projectors, opts, numParallel, config)
+	}
+	s.load(a.req, ml.SystemInfo{}, []ml.DeviceInfo{}, false)
+	select {
+	case err := <-a.req.errCh:
+		t.Fatal(err)
+	case resp := <-a.req.successCh:
+		require.Equal(t, 4, resp.numParallel)
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	require.Equal(t, 4, gotParallel)
+}
+
+func TestSchedRPCServersHeldByLoadedRunners(t *testing.T) {
+	t.Setenv("OLLAMA_RPC_SERVERS", "10.0.0.1:50053, 10.0.0.2:50053,10.0.0.3:50053")
+	s := InitScheduler(t.Context())
+
+	require.Equal(t, "10.0.0.1:50053,10.0.0.2:50053,10.0.0.3:50053", s.freeRPCServers())
+	require.False(t, s.allRPCServersHeld())
+
+	s.loadedMu.Lock()
+	s.loaded["a"] = &runnerRef{rpcEndpoints: []string{"10.0.0.2:50053"}}
+	s.loadedMu.Unlock()
+	require.Equal(t, "10.0.0.1:50053,10.0.0.3:50053", s.freeRPCServers())
+	require.False(t, s.allRPCServersHeld())
+
+	s.loadedMu.Lock()
+	s.loaded["b"] = &runnerRef{rpcEndpoints: []string{"10.0.0.1:50053", "10.0.0.3:50053"}}
+	s.loadedMu.Unlock()
+	require.Empty(t, s.freeRPCServers())
+	require.True(t, s.allRPCServersHeld())
+
+	t.Setenv("OLLAMA_RPC_SERVERS", "")
+	require.False(t, s.allRPCServersHeld())
+}
+
+func TestRPCEndpoints(t *testing.T) {
+	gpus := []ml.DeviceInfo{
+		{DeviceID: ml.DeviceID{ID: "10.0.0.1:50053:0", Library: "rpc"}},
+		{DeviceID: ml.DeviceID{ID: "10.0.0.1:50053:1", Library: "rpc"}},
+		{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}},
+		{DeviceID: ml.DeviceID{ID: "10.0.0.2:50053:0", Library: "rpc"}},
+	}
+	require.Equal(t, []string{"10.0.0.1:50053", "10.0.0.2:50053"}, llm.RPCEndpoints(gpus))
+	require.Empty(t, llm.RPCEndpoints(nil))
+}
+
+func TestSchedEvictsWhenAllRPCServersHeld(t *testing.T) {
+	// Nothing listens on port 1, so probing a free endpoint fails fast.
+	t.Setenv("OLLAMA_RPC_SERVERS", "127.0.0.1:1")
+	t.Setenv("OLLAMA_MAX_LOADED_MODELS", "0")
+	ctx, done := context.WithTimeout(t.Context(), 2*time.Second)
+	defer done()
+	s := InitScheduler(ctx)
+	s.waitForRecovery = 10 * time.Millisecond
+	s.getGpuFn = func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo {
+		return []ml.DeviceInfo{}
+	}
+	s.getSystemInfoFn = getSystemInfoFn
+
+	a := newScenarioRequest(t, ctx, "model-a", 10, &api.Duration{Duration: time.Hour}, nil)
+	b := newScenarioRequest(t, ctx, "model-b", 10, &api.Duration{Duration: time.Hour}, nil)
+
+	s.newServerFn = a.newServer
+	s.pendingReqCh <- a.req
+	s.Run(ctx)
+	var runnerA *runnerRef
+	select {
+	case runnerA = <-a.req.successCh:
+	case err := <-a.req.errCh:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+
+	// Model A now holds the only RPC server; finish its request so it's idle.
+	s.loadedMu.Lock()
+	runnerA.rpcEndpoints = []string{"127.0.0.1:1"}
+	s.loadedMu.Unlock()
+	a.ctxDone()
+	require.Eventually(t, func() bool {
+		runnerA.refMu.Lock()
+		defer runnerA.refMu.Unlock()
+		return runnerA.refCount == 0
+	}, time.Second, 5*time.Millisecond)
+
+	s.newServerFn = b.newServer
+	s.pendingReqCh <- b.req
+	select {
+	case resp := <-b.req.successCh:
+		require.Equal(t, b.srv, resp.llama)
+	case err := <-b.req.errCh:
+		t.Fatal(err)
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+	require.True(t, a.srv.closeCalled, "model A should have been unloaded to free the RPC server")
+	s.loadedMu.Lock()
+	require.Len(t, s.loaded, 1)
+	s.loadedMu.Unlock()
+}
