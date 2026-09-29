@@ -1209,6 +1209,7 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	var data [][]string
+	var rpcServers []string
 
 	for _, m := range models.Models {
 		if len(args) == 0 || strings.HasPrefix(m.Name, args[0]) {
@@ -1235,11 +1236,21 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 			}
 			ctxStr := strconv.Itoa(m.ContextLength)
 			data = append(data, []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, ctxStr, until})
+			rpcServers = append(rpcServers, strings.Join(m.RPCServers, ","))
+		}
+	}
+
+	header := []string{"NAME", "ID", "SIZE", "PROCESSOR", "CONTEXT", "UNTIL"}
+	// Only show the RPC column when a model runs on RPC servers.
+	if slices.ContainsFunc(rpcServers, func(s string) bool { return s != "" }) {
+		header = slices.Insert(header, 4, "RPC")
+		for i := range data {
+			data[i] = slices.Insert(data[i], 4, rpcServers[i])
 		}
 	}
 
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"NAME", "ID", "SIZE", "PROCESSOR", "CONTEXT", "UNTIL"})
+	table.SetHeader(header)
 	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
 	table.SetAlignment(tablewriter.ALIGN_LEFT)
 	table.SetHeaderLine(false)

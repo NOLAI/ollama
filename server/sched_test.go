@@ -2340,29 +2340,6 @@ func TestSchedLoadHonorsNumParallelForHybridArchitectures(t *testing.T) {
 	require.Equal(t, 4, gotParallel)
 }
 
-func TestSchedRPCServersHeldByLoadedRunners(t *testing.T) {
-	t.Setenv("OLLAMA_RPC_SERVERS", "10.0.0.1:50053, 10.0.0.2:50053,10.0.0.3:50053")
-	s := InitScheduler(t.Context())
-
-	require.Equal(t, "10.0.0.1:50053,10.0.0.2:50053,10.0.0.3:50053", s.freeRPCServers())
-	require.False(t, s.allRPCServersHeld())
-
-	s.loadedMu.Lock()
-	s.loaded["a"] = &runnerRef{rpcEndpoints: []string{"10.0.0.2:50053"}}
-	s.loadedMu.Unlock()
-	require.Equal(t, "10.0.0.1:50053,10.0.0.3:50053", s.freeRPCServers())
-	require.False(t, s.allRPCServersHeld())
-
-	s.loadedMu.Lock()
-	s.loaded["b"] = &runnerRef{rpcEndpoints: []string{"10.0.0.1:50053", "10.0.0.3:50053"}}
-	s.loadedMu.Unlock()
-	require.Empty(t, s.freeRPCServers())
-	require.True(t, s.allRPCServersHeld())
-
-	t.Setenv("OLLAMA_RPC_SERVERS", "")
-	require.False(t, s.allRPCServersHeld())
-}
-
 func TestRPCEndpoints(t *testing.T) {
 	gpus := []ml.DeviceInfo{
 		{DeviceID: ml.DeviceID{ID: "10.0.0.1:50053:0", Library: "rpc"}},
@@ -2374,57 +2351,109 @@ func TestRPCEndpoints(t *testing.T) {
 	require.Empty(t, llm.RPCEndpoints(nil))
 }
 
-func TestSchedEvictsWhenAllRPCServersHeld(t *testing.T) {
-	// Nothing listens on port 1, so probing a free endpoint fails fast.
-	t.Setenv("OLLAMA_RPC_SERVERS", "127.0.0.1:1")
-	t.Setenv("OLLAMA_MAX_LOADED_MODELS", "0")
-	ctx, done := context.WithTimeout(t.Context(), 2*time.Second)
+func TestPreferIdleRPCServers(t *testing.T) {
+	rpc := func(host string, free uint64) ml.DeviceInfo {
+		return ml.DeviceInfo{DeviceID: ml.DeviceID{ID: host + ":50053:0", Library: "rpc"}, FreeMemory: free * format.GigaByte}
+	}
+	held := map[string]bool{"10.0.0.1:50053": true, "10.0.0.4:50053": true}
+
+	tests := []struct {
+		name      string
+		gpus      []ml.DeviceInfo
+		held      map[string]bool
+		predicted uint64
+		opts      api.Options
+		want      []string
+	}{
+		{
+			name:      "empty server preferred over a roomier one in use",
+			gpus:      []ml.DeviceInfo{rpc("10.0.0.1", 100), rpc("10.0.0.2", 60), rpc("10.0.0.3", 50)},
+			held:      held,
+			predicted: 20,
+			opts:      api.DefaultOptions(),
+			want:      []string{"10.0.0.2:50053:0"},
+		},
+		{
+			name:      "shares a server in use rather than splitting across empty ones",
+			gpus:      []ml.DeviceInfo{rpc("10.0.0.1", 100), rpc("10.0.0.2", 30), rpc("10.0.0.3", 30)},
+			held:      held,
+			predicted: 50,
+			opts:      api.DefaultOptions(),
+			want:      []string{"10.0.0.1:50053:0"},
+		},
+		{
+			name:      "model needing several servers spans only empty ones",
+			gpus:      []ml.DeviceInfo{rpc("10.0.0.1", 70), rpc("10.0.0.2", 60), rpc("10.0.0.3", 50), rpc("10.0.0.4", 45)},
+			held:      held,
+			predicted: 100,
+			opts:      api.DefaultOptions(),
+			want:      []string{"10.0.0.2:50053:0", "10.0.0.3:50053:0"},
+		},
+		{
+			name:      "no servers in use leaves placement unchanged",
+			gpus:      []ml.DeviceInfo{rpc("10.0.0.1", 100), rpc("10.0.0.2", 60)},
+			held:      map[string]bool{},
+			predicted: 20,
+			opts:      api.DefaultOptions(),
+			want:      []string{"10.0.0.1:50053:0"},
+		},
+		{
+			name:      "explicit main gpu is left alone",
+			gpus:      []ml.DeviceInfo{rpc("10.0.0.1", 100), rpc("10.0.0.2", 60)},
+			held:      held,
+			predicted: 20,
+			opts:      api.Options{Runner: api.Runner{MainGPU: testIntPtr(0), NumGPU: -1}},
+			want:      []string{"10.0.0.1:50053:0"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			systemInfo := ml.SystemInfo{}
+			predicted := tt.predicted * format.GigaByte
+			gpus := preferIdleRPCServers(systemInfo, tt.gpus, tt.held, predicted, tt.opts)
+			selected, _ := selectLlamaServerPlacement(systemInfo, gpus, predicted, tt.opts)
+			var got []string
+			for _, gpu := range selected {
+				got = append(got, gpu.ID)
+			}
+			require.ElementsMatch(t, tt.want, got)
+		})
+	}
+}
+
+func TestSchedLoadRecordsRPCEndpoints(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer done()
 	s := InitScheduler(ctx)
 	s.waitForRecovery = 10 * time.Millisecond
-	s.getGpuFn = func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo {
-		return []ml.DeviceInfo{}
-	}
-	s.getSystemInfoFn = getSystemInfoFn
 
-	a := newScenarioRequest(t, ctx, "model-a", 10, &api.Duration{Duration: time.Hour}, nil)
-	b := newScenarioRequest(t, ctx, "model-b", 10, &api.Duration{Duration: time.Hour}, nil)
-
+	a := newScenarioRequest(t, ctx, "model-a", 10, nil, nil)
 	s.newServerFn = a.newServer
-	s.pendingReqCh <- a.req
-	s.Run(ctx)
-	var runnerA *runnerRef
+	gpus := []ml.DeviceInfo{{DeviceID: ml.DeviceID{ID: "10.0.0.2:50053:0", Library: "rpc"}, FreeMemory: 60 * format.GigaByte}}
+	s.load(a.req, ml.SystemInfo{}, gpus, false)
 	select {
-	case runnerA = <-a.req.successCh:
 	case err := <-a.req.errCh:
 		t.Fatal(err)
+	case resp := <-a.req.successCh:
+		require.Equal(t, []string{"10.0.0.2:50053"}, resp.rpcEndpoints)
 	case <-ctx.Done():
 		t.Fatal("timeout")
 	}
+	require.Equal(t, map[string]bool{"10.0.0.2:50053": true}, s.heldRPCServers())
+}
 
-	// Model A now holds the only RPC server; finish its request so it's idle.
+func TestSchedLoadedModelsReportsRPCServers(t *testing.T) {
+	s := InitScheduler(t.Context())
 	s.loadedMu.Lock()
-	runnerA.rpcEndpoints = []string{"127.0.0.1:1"}
+	s.loaded["a"] = &runnerRef{model: &Model{Name: "a"}, rpcEndpoints: []string{"10.0.0.2:50053"}}
+	s.loaded["b"] = &runnerRef{model: &Model{Name: "b"}}
 	s.loadedMu.Unlock()
-	a.ctxDone()
-	require.Eventually(t, func() bool {
-		runnerA.refMu.Lock()
-		defer runnerA.refMu.Unlock()
-		return runnerA.refCount == 0
-	}, time.Second, 5*time.Millisecond)
 
-	s.newServerFn = b.newServer
-	s.pendingReqCh <- b.req
-	select {
-	case resp := <-b.req.successCh:
-		require.Equal(t, b.srv, resp.llama)
-	case err := <-b.req.errCh:
-		t.Fatal(err)
-	case <-ctx.Done():
-		t.Fatal("timeout")
+	got := map[string][]string{}
+	for _, m := range s.loadedModels() {
+		got[m.model.Name] = m.rpcServers
 	}
-	require.True(t, a.srv.closeCalled, "model A should have been unloaded to free the RPC server")
-	s.loadedMu.Lock()
-	require.Len(t, s.loaded, 1)
-	s.loadedMu.Unlock()
+	require.Equal(t, []string{"10.0.0.2:50053"}, got["a"])
+	require.Empty(t, got["b"])
 }

@@ -271,12 +271,6 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
 					slog.Debug("max runners achieved, unloading one to make room", "runner_count", loadedCount)
 					runnerToExpire = s.findRunnerToUnload()
-				} else if pending.opts.NumGPU != 0 && s.allRPCServersHeld() && len(s.getGpuFn(ctx, runnersSnapshot)) == 0 {
-					// Every device is an RPC server held by a loaded runner, and an
-					// RPC server serves one client at a time. Evict a runner rather
-					// than falling through to a CPU-only load.
-					slog.Info("all RPC servers are held by loaded models, unloading one to make room", "model", pending.model.ModelPath)
-					runnerToExpire = s.findRunnerToUnload()
 				} else {
 					// Either no models are loaded or below envconfig.MaxRunners
 					// Get a refreshed GPU list
@@ -286,7 +280,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					} else {
 						logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
 						gpus = s.getGpuFn(ctx, runnersSnapshot)
-						if rpcServers := s.freeRPCServers(); rpcServers != "" {
+						if rpcServers := envconfig.RPCServers(); rpcServers != "" {
 							gpus = append(gpus, discover.GetRPCServers(rpcServers)...)
 						}
 					}
@@ -527,6 +521,8 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		sessionDuration = req.sessionDuration.Duration
 	}
 
+	heldRPC := s.heldRPCServers()
+
 	s.loadedMu.Lock()
 	llama := s.activeLoading
 	var f *gguf.Model
@@ -547,7 +543,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
-			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
+			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, preferIdleRPCServers(systemInfo, gpus, heldRPC, predicted, req.opts), predicted, req.opts)
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
 			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
@@ -1054,6 +1050,50 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 	selected := bestGPUGroupByAvailableMemory(systemInfo, groups)
 	logSelectedGPUGroup(gpus, selected)
 	return selected, launchOpts
+}
+
+// preferIdleRPCServers narrows gpus to the devices no loaded model is using, so
+// a new model starts on an empty RPC server rather than sharing one with
+// another model. It only narrows when that doesn't split the model across more
+// servers than it needs: a model that fits on a single in-use server is
+// placed there rather than split across idle ones, since every server boundary
+// costs a network round trip per token. Otherwise gpus is returned unchanged
+// and placement falls back to free memory.
+func preferIdleRPCServers(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, held map[string]bool, predictedVRAM uint64, opts api.Options) []ml.DeviceInfo {
+	if len(held) == 0 || predictedVRAM == 0 || opts.NumGPU == 0 || opts.MainGPU != nil || envconfig.SchedSpread() {
+		return gpus
+	}
+
+	idle := make([]ml.DeviceInfo, 0, len(gpus))
+	for _, gpu := range gpus {
+		if gpu.Library == "rpc" && held[llm.RPCEndpoints([]ml.DeviceInfo{gpu})[0]] {
+			continue
+		}
+		idle = append(idle, gpu)
+	}
+	if len(idle) == 0 || len(idle) == len(gpus) {
+		return gpus
+	}
+
+	idleGroups := ml.ByLibrary(idle)
+	if _, _, ok := bestSingleGPUFit(systemInfo, idleGroups, predictedVRAM); ok {
+		slog.Info("preferring RPC servers not used by loaded models", "idle_gpu_count", len(idle), "gpu_count", len(gpus))
+		return idle
+	}
+	if _, _, ok := bestSingleGPUFit(systemInfo, ml.ByLibrary(gpus), predictedVRAM); ok {
+		return gpus
+	}
+	for _, group := range idleGroups {
+		var total uint64
+		for _, gpu := range group {
+			total += availableMemoryForGPU(systemInfo, gpu)
+		}
+		if predictedVRAM <= total*singleGPUFitPercent/100 {
+			slog.Info("preferring RPC servers not used by loaded models", "idle_gpu_count", len(idle), "gpu_count", len(gpus))
+			return idle
+		}
+	}
+	return gpus
 }
 
 // smallestGPUSubsetFit finds the fewest devices from a single group that hold
@@ -1751,10 +1791,7 @@ func (s *Scheduler) expireRunnersForRuntimeOOM(model *Model, err error) {
 	}
 }
 
-// heldRPCServers returns the RPC endpoints that loaded runners hold a
-// connection to. llama-rpc-server serves a single client connection at a time,
-// so a held endpoint can't host another model and won't answer a discovery
-// probe until its runner exits.
+// heldRPCServers returns the RPC endpoints that loaded runners are using.
 func (s *Scheduler) heldRPCServers() map[string]bool {
 	held := make(map[string]bool)
 	s.loadedMu.Lock()
@@ -1765,48 +1802,6 @@ func (s *Scheduler) heldRPCServers() map[string]bool {
 		}
 	}
 	return held
-}
-
-// configuredRPCServers returns the endpoints listed in OLLAMA_RPC_SERVERS.
-func configuredRPCServers() []string {
-	var endpoints []string
-	for _, endpoint := range strings.Split(envconfig.RPCServers(), ",") {
-		if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
-			endpoints = append(endpoints, endpoint)
-		}
-	}
-	return endpoints
-}
-
-// freeRPCServers returns the configured RPC endpoints, comma separated, that no
-// loaded runner holds.
-func (s *Scheduler) freeRPCServers() string {
-	held := s.heldRPCServers()
-	var free []string
-	for _, endpoint := range configuredRPCServers() {
-		if held[endpoint] {
-			slog.Debug("skipping RPC server held by a loaded model", "endpoint", endpoint)
-			continue
-		}
-		free = append(free, endpoint)
-	}
-	return strings.Join(free, ",")
-}
-
-// allRPCServersHeld reports whether RPC servers are configured and every one
-// of them is held by a loaded runner.
-func (s *Scheduler) allRPCServersHeld() bool {
-	configured := configuredRPCServers()
-	if len(configured) == 0 {
-		return false
-	}
-	held := s.heldRPCServers()
-	for _, endpoint := range configured {
-		if !held[endpoint] {
-			return false
-		}
-	}
-	return true
 }
 
 // findRunnerToUnload finds a runner to unload to make room for a new model
@@ -1887,6 +1882,7 @@ type loadedModel struct {
 	sizeVRAM      int64
 	contextLength int
 	expiresAt     time.Time
+	rpcServers    []string
 }
 
 // loadedModels returns a snapshot of the currently loaded models for status
@@ -1910,10 +1906,11 @@ func (s *Scheduler) loadedModels() []loadedModel {
 			continue
 		}
 		lm := loadedModel{
-			model:     r.model,
-			size:      int64(r.totalSize),
-			sizeVRAM:  int64(r.vramSize),
-			expiresAt: r.expiresAt,
+			model:      r.model,
+			size:       int64(r.totalSize),
+			sizeVRAM:   int64(r.vramSize),
+			expiresAt:  r.expiresAt,
+			rpcServers: slices.Clone(r.rpcEndpoints),
 		}
 		if r.llama != nil {
 			lm.contextLength = r.llama.ContextLength()

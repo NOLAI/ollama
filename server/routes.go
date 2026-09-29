@@ -2353,6 +2353,7 @@ func (s *Server) PsHandler(c *gin.Context) {
 			Details:       modelDetails,
 			ExpiresAt:     v.expiresAt,
 			ContextLength: v.contextLength,
+			RPCServers:    v.rpcServers,
 		})
 	}
 

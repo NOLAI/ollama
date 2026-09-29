@@ -861,6 +861,7 @@ type ProcessModelResponse struct {
 	ExpiresAt     time.Time    `json:"expires_at"`
 	SizeVRAM      int64        `json:"size_vram"`
 	ContextLength int          `json:"context_length"`
+	RPCServers    []string     `json:"rpc_servers,omitempty"`
 }
 
 type TokenResponse struct {

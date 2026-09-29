@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -2911,4 +2912,61 @@ func TestFormerAgentEntryPointsAreRejected(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestListRunningHandlerRPCColumn(t *testing.T) {
+	run := func(t *testing.T, models []api.ProcessModelResponse) string {
+		t.Helper()
+		mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/ps" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(api.ProcessResponse{Models: models})
+		}))
+		t.Setenv("OLLAMA_HOST", mockServer.URL)
+		t.Cleanup(mockServer.Close)
+
+		cmd := &cobra.Command{}
+		cmd.SetContext(t.Context())
+
+		oldStdout := os.Stdout
+		r, w, _ := os.Pipe()
+		os.Stdout = w
+		err := ListRunningHandler(cmd, nil)
+		w.Close()
+		os.Stdout = oldStdout
+		if err != nil {
+			t.Fatalf("ListRunningHandler returned error: %v", err)
+		}
+		var out bytes.Buffer
+		io.Copy(&out, r)
+		return out.String()
+	}
+
+	expires := time.Now().Add(time.Hour)
+	local := api.ProcessModelResponse{Name: "local:latest", Digest: "aaaaaaaaaaaaaaaa", Size: 10, SizeVRAM: 10, ContextLength: 4096, ExpiresAt: expires}
+	remote := api.ProcessModelResponse{Name: "remote:latest", Digest: "bbbbbbbbbbbbbbbb", Size: 10, SizeVRAM: 10, ContextLength: 4096, ExpiresAt: expires, RPCServers: []string{"10.0.0.2:50053", "10.0.0.3:50053"}}
+
+	t.Run("shows rpc servers when a model uses them", func(t *testing.T) {
+		out := run(t, []api.ProcessModelResponse{local, remote})
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		if len(lines) != 3 {
+			t.Fatalf("expected header and two rows, got:\n%s", out)
+		}
+		if fields := strings.Fields(lines[0]); !slices.Equal(fields, []string{"NAME", "ID", "SIZE", "PROCESSOR", "RPC", "CONTEXT", "UNTIL"}) {
+			t.Errorf("unexpected header %q", lines[0])
+		}
+		if !strings.Contains(lines[2], "10.0.0.2:50053,10.0.0.3:50053") {
+			t.Errorf("rpc servers missing from row %q", lines[2])
+		}
+	})
+
+	t.Run("omits rpc column without rpc models", func(t *testing.T) {
+		out := run(t, []api.ProcessModelResponse{local})
+		if strings.Contains(out, "RPC") {
+			t.Errorf("unexpected RPC column:\n%s", out)
+		}
+	})
 }
